@@ -902,6 +902,8 @@ void ckch_inst_free(struct ckch_inst *inst)
 	inst->ctx = NULL;
 	LIST_DELETE(&inst->by_ckchs);
 	LIST_DELETE(&inst->by_crtlist_entry);
+	LIST_DELETE(&inst->by_cafile_entry);
+	LIST_DELETE(&inst->by_cavfile_entry);
 	free(inst);
 }
 
@@ -917,6 +919,8 @@ struct ckch_inst *ckch_inst_new()
 	LIST_INIT(&ckch_inst->sni_ctx);
 	LIST_INIT(&ckch_inst->by_ckchs);
 	LIST_INIT(&ckch_inst->by_crtlist_entry);
+	LIST_INIT(&ckch_inst->by_cafile_entry);
+	LIST_INIT(&ckch_inst->by_cavfile_entry);
 
 	return ckch_inst;
 }
@@ -932,7 +936,7 @@ struct eb_root cafile_tree = EB_ROOT;
  * given path, the original one and the new one set via the CLI but not
  * committed yet).
  */
-static struct cafile_entry *ssl_store_get_cafile_entry(char *path, int oldest_entry)
+struct cafile_entry *ssl_store_get_cafile_entry(char *path, int oldest_entry)
 {
 	struct cafile_entry *ca_e = NULL;
 	struct ebmb_node *eb;
@@ -979,6 +983,8 @@ int ssl_store_load_locations_file(char *path, int create_if_none)
 			if (ca_e) {
 				memcpy(ca_e->path, path, pathlen + 1);
 				ca_e->ca_store = store;
+				LIST_INIT(&ca_e->ckch_inst);
+				LIST_INIT(&ca_e->verify_ckch_inst);
 				ebst_insert(&cafile_tree, &ca_e->node);
 			}
 		} else {
@@ -1107,6 +1113,83 @@ static int ssl_sock_get_san_oneline(X509 *cert, struct buffer *out)
 	return 0;
 }
 #endif
+
+
+/*
+ * Link a CA file tree entry to the ckch instance that uses it.
+ * To determine if and which CA file tree entries need to be linked to the
+ * instance, we follow the same logic performed in ssl_sock_prepare_ctx when
+ * processing the verify option.
+ * This function works for a frontend as well as for a backend, depending on the
+ * configuration parameters given (bind_conf or server).
+ */
+void ckch_inst_add_cafile_link(struct ckch_inst *ckch_inst, struct bind_conf *bind_conf,
+			       struct ssl_bind_conf *ssl_conf, const struct server *srv)
+{
+	int verify = SSL_VERIFY_NONE;
+
+	if (srv) {
+
+		if (global.ssl_server_verify == SSL_SERVER_VERIFY_REQUIRED)
+			verify = SSL_VERIFY_PEER;
+		switch (srv->ssl_ctx.verify) {
+		case SSL_SOCK_VERIFY_NONE:
+			verify = SSL_VERIFY_NONE;
+			break;
+		case SSL_SOCK_VERIFY_REQUIRED:
+			verify = SSL_VERIFY_PEER;
+			break;
+		}
+	}
+	else {
+		switch ((ssl_conf && ssl_conf->verify) ? ssl_conf->verify : bind_conf->ssl_conf.verify) {
+		case SSL_SOCK_VERIFY_NONE:
+			verify = SSL_VERIFY_NONE;
+			break;
+		case SSL_SOCK_VERIFY_OPTIONAL:
+			verify = SSL_VERIFY_PEER;
+			break;
+		case SSL_SOCK_VERIFY_REQUIRED:
+			verify = SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+			break;
+		}
+	}
+
+	if (verify & SSL_VERIFY_PEER) {
+		struct cafile_entry *ca_file_entry = NULL;
+		struct cafile_entry *ca_verify_file_entry = NULL;
+		if (srv) {
+			if (srv->ssl_ctx.ca_file) {
+				ca_file_entry = ssl_store_get_cafile_entry(srv->ssl_ctx.ca_file, 0);
+
+			}
+		}
+		else {
+			char *ca_file = (ssl_conf && ssl_conf->ca_file) ? ssl_conf->ca_file : bind_conf->ssl_conf.ca_file;
+			char *ca_verify_file = (ssl_conf && ssl_conf->ca_verify_file) ? ssl_conf->ca_verify_file : bind_conf->ssl_conf.ca_verify_file;
+
+			if (ca_file)
+				ca_file_entry = ssl_store_get_cafile_entry(ca_file, 0);
+			if (ca_verify_file)
+				ca_verify_file_entry = ssl_store_get_cafile_entry(ca_verify_file, 0);
+		}
+
+		if (ca_file_entry) {
+			/* If we have a ckch instance that is not already in the
+			 * cafile_entry's list, add it to it. */
+			if (ckch_inst && ckch_inst->by_cafile_entry.n == &ckch_inst->by_cafile_entry)
+				LIST_INSERT(&ca_file_entry->ckch_inst, &ckch_inst->by_cafile_entry);
+
+		}
+		if (ca_verify_file_entry && (ca_file_entry != ca_verify_file_entry)) {
+			/* If we have a ckch instance that is not already in the
+			 * cafile_entry's list, add it to it. */
+			if (ckch_inst && ckch_inst->by_cavfile_entry.n == &ckch_inst->by_cavfile_entry)
+				LIST_INSERT(&ca_verify_file_entry->verify_ckch_inst, &ckch_inst->by_cavfile_entry);
+
+		}
+	}
+}
 
 
 
@@ -1407,7 +1490,7 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 					new_inst->server = ckchi->server;
 					/* Create a new SSL_CTX and link it to the new instance. */
 					if (new_inst->is_server_instance) {
-						retval = ssl_sock_prepare_srv_ssl_ctx(ckchi->server, new_inst->ctx);
+						retval = ssl_sock_prep_srv_ctx_and_inst(ckchi->server, new_inst->ctx, new_inst);
 						if (retval)
 							goto error;
 					}
@@ -1419,7 +1502,7 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 					/* this iterate on the newly generated SNIs in the new instance to prepare their SSL_CTX */
 					list_for_each_entry_safe(sc0, sc0s, &new_inst->sni_ctx, by_ckch_inst) {
 						if (!sc0->order) { /* we initialized only the first SSL_CTX because it's the same in the other sni_ctx's */
-							errcode |= ssl_sock_prepare_ctx(ckchi->bind_conf, ckchi->ssl_conf, sc0->ctx, &err);
+							errcode |= ssl_sock_prep_ctx_and_inst(ckchi->bind_conf, ckchi->ssl_conf, sc0->ctx, sc0->ckch_inst, &err);
 							if (errcode & ERR_CODE)
 								goto error;
 						}
