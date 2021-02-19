@@ -1094,7 +1094,7 @@ static int cli_io_handler_add_crtlist(struct appctx *appctx)
 					/* this iterate on the newly generated SNIs in the new instance to prepare their SSL_CTX */
 					list_for_each_entry(sni, &new_inst->sni_ctx, by_ckch_inst) {
 						if (!sni->order) { /* we initialized only the first SSL_CTX because it's the same in the other sni_ctx's */
-							errcode |= ssl_sock_prepare_ctx(bind_conf, new_inst->ssl_conf, sni->ctx, &err);
+							errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, new_inst->ssl_conf, sni->ctx, sni->ckch_inst, &err);
 							if (errcode & ERR_CODE)
 								goto error;
 						}
@@ -1417,6 +1417,8 @@ static int cli_parse_del_crtlist(char **args, char *payload, struct appctx *appc
 		}
 		HA_RWLOCK_WRUNLOCK(SNI_LOCK, &inst->bind_conf->sni_lock);
 		LIST_DELETE(&inst->by_ckchs);
+		LIST_DELETE(&inst->by_cafile_entry);
+		LIST_DELETE(&inst->by_cavfile_entry);
 		free(inst);
 	}
 

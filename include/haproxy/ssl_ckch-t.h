@@ -93,6 +93,8 @@ struct ckch_inst {
 	struct list sni_ctx; /* list of sni_ctx using this ckch_inst */
 	struct list by_ckchs; /* chained in ckch_store's list of ckch_inst */
 	struct list by_crtlist_entry; /* chained in crtlist_entry list of inst */
+	struct list by_cafile_entry; /* chained in cafile_entry's list of ckch_inst */
+	struct list by_cavfile_entry; /* chained in cafile_entry's list of verify_ckch_inst */
 };
 
 
@@ -102,6 +104,8 @@ struct ckch_inst {
 struct cafile_entry {
 	X509_STORE *ca_store;
 	STACK_OF(X509_NAME) *ca_list;
+	struct list ckch_inst; /* list of ckch_inst which use this CA file entry (ca-file option) */
+	struct list verify_ckch_inst; /* list of ckch_inst which use this CA file (ca-verify-file option) */
 	struct ebmb_node node;
 	char path[0];
 };
