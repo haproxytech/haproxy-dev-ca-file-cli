@@ -179,6 +179,10 @@ struct appctx {
 			struct ckch_store *old_ckchs;
 			struct ckch_store *new_ckchs;
 			struct ckch_inst *next_ckchi;
+
+			struct cafile_entry *old_cafile_entry;
+			struct cafile_entry *new_cafile_entry;
+			int ca_verify_instances; /* walk through the CA-verify instances instead of the regular CA entries */
 		} ssl;
 		struct {
 			void *ptr;
